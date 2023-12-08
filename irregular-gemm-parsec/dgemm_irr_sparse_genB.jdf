@@ -1,0 +1,459 @@
+extern "C" %{
+/*
+ * Copyright (c) 2020-2023 The University of Tennessee and The University
+ *                         of Tennessee Research Foundation. All rights
+ *                         reserved.
+ *
+ * @generated d Thu Dec  7 16:50:48 2023
+ * $COPYRIGHT
+ *
+ */
+
+#include <math.h>
+#include <time.h>
+
+#include "parsec.h"
+#include "parsec/data_dist/matrix/two_dim_rectangle_cyclic.h"
+#include "irr_bs_tm.h"
+
+#include "gemm_irr_sparse.h"
+
+#if defined(IGGOP_HAVE_CUDA)
+#include <cublas.h>
+#endif  /* defined(IGGOP_HAVE_CUDA) */
+#if defined(IGGOP_HAVE_HIP)
+#include <hipblas.h>
+#endif  /* defined(IGGOP_HAVE_HIP) */
+
+#undef GIBS_DEBUG
+
+#define imin(a, b) ( (a)<(b) ? (a) : (b) )
+#define imax(a, b) ( (a)>(b) ? (a) : (b) )
+
+%}
+
+/* Keep this first, as in all jdf in this directory, to
+ * enable switching between GEMM implementations.
+ * This is the JDF-like CRTP ;)
+ */
+gemm_type [ type = int ]
+
+alpha      [ type = double ]
+beta       [ type = double ]
+
+/*
+ * A is MT x KT
+ * B is KT x NT
+ * C is MT x NT
+ */
+descA      [ type = "const irr_bs_tm_t *"      ]
+genB       [ type = "irr_bs_tm_t *"            ]
+descC      [ type = "irr_bs_tm_t *"            ]
+TrivDist   [ type = "parsec_matrix_block_cyclic_t *" ]
+
+plan       [ type = "gemm_irr_sparse_plan_t*"  ]
+
+nb_gpu_devices   [ type = "int"   ]
+gpu_device_index [ type = "int *" ]
+
+RL [ type = "int" default=0 hidden=on ]
+CL [ type = "int" default=4 hidden=on ]
+GL [ type = "int" default=1 hidden=on ]
+
+flops     [ type = "int64_t" default=-1 hidden=on ]
+last_log  [ type = "time_t"  default=0  hidden=on ]
+start_log [ type = "time_t"  default=0  hidden=on ]
+
+handles_infokey [type = "int" hidden = on default = -1 ]
+
+READ_A(m, k)
+
+  m = [im = 0 .. %{ return descA->sparsity->nb_nnz_row-1; %} ] %{ return descA->sparsity->nnz_rows_index[im]; %}
+  k = [ik = 0 .. %{ return descA->sparsity->nb_nnz_cols_in_row[m] - 1; %} ] %{ return irr_tm_sparse_block_col_from_index(descA, m, ik); %}
+
+:descA(m, k)
+
+/* Columns of A are replicated on the nodes,
+ * and rows of A are distributed between them.
+ * There is no control flow necessary, as long as memory is large enough. */
+
+READ A <- descA(m, k)                      [ layout=parsec_datatype_double_t  count=%{ return irr_bs_tm_get_tile_count(descA, m, k); %}
+                                             layout_data=parsec_datatype_double_t  count_data=%{ return irr_bs_tm_get_tile_count(descA, m, k); %}
+                                             layout_remote=parsec_datatype_double_t  count_remote=%{ return irr_bs_tm_get_tile_count(descA, m, k); %} ]
+       -> [n = 0 .. genB->nt-1] %{ int ret = irr_tm_sparse_block_is_full(genB, k, n) && irr_tm_sparse_block_is_full(descC, m, n); return ret; %} ?
+            A GEMM(m, n, k)                [ layout=parsec_datatype_double_t  count=%{ return irr_bs_tm_get_tile_count(descA, m, k); %}
+                                             layout_data=parsec_datatype_double_t  count_data=%{ return irr_bs_tm_get_tile_count(descA, m, k); %}
+                                             layout_remote=parsec_datatype_double_t  count_remote=%{ return irr_bs_tm_get_tile_count(descA, m, k); %} ]
+
+; 1000
+
+BODY
+#if defined(GIBS_DEBUG)
+        fprintf(stderr, "READ_A(%d, %d)\n", m, k);
+#endif
+END
+
+
+
+GEN_B(k, n, prank, qrank)
+
+  prank = 0 .. (TrivDist->grid.rows-1)
+  qrank = 0 .. (TrivDist->grid.cols-1)
+  n = [in = 0 .. %{ return gemm_irr_sparse_plan_B_last_col(plan, prank, qrank); %} ]      %{ return gemm_irr_sparse_plan_B_col(plan, prank, qrank, in); %}
+  k = [ik = 0 .. %{ return gemm_irr_sparse_plan_B_last_row(plan, prank, qrank, n); %}    ] %{ return gemm_irr_sparse_plan_B_row(plan, prank, qrank, n, ik); %}
+
+  g = %{ if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank)) return gemm_irr_sparse_genB_gpu(plan, n); return -1; %}
+  p = %{ if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank)) { return gemm_irr_sparse_genB_column_phase(plan, n) - GL;} return -1; %}
+
+: TrivDist(prank, qrank)
+
+WRITE B <- NEW           [ layout=parsec_datatype_double_t  count=%{ return irr_bs_tm_get_tile_count(genB, k, n); %}
+                           layout_data=parsec_datatype_double_t  count_data=%{ return irr_bs_tm_get_tile_count(genB, k, n); %}
+                           layout_remote=parsec_datatype_double_t  count_remote=%{ return irr_bs_tm_get_tile_count(genB, k, n); %} ]
+        -> [m = 0 .. descA->mt-1] %{ return irr_tm_sparse_block_is_full(descA, m, k) &&
+                                            irr_tm_sparse_block_is_full(descC, m, n) &&
+                                            prank == gemm_irr_sparse_row_rank_of_gemm(plan, m, n, k) &&
+                                            qrank == gemm_irr_sparse_col_rank_of_gemm(plan, m, n, k); %} ? B GEMM(m, n, k)
+                                            [ layout=parsec_datatype_double_t  count=%{ return irr_bs_tm_get_tile_count(genB, k, n); %}
+                                                layout_data=parsec_datatype_double_t  count_data=%{ return irr_bs_tm_get_tile_count(genB, k, n); %}
+                                              layout_remote=parsec_datatype_double_t  count_remote=%{ return irr_bs_tm_get_tile_count(genB, k, n); %} ]
+
+CTL COL <- p > -1 ? COL COLUMN_PHASE_CONTROLLER(prank, qrank, g, p)
+
+; 0
+
+BODY
+#if defined(GIBS_DEBUG)
+        fprintf(stderr, "Generating B(%d, %d)\n", k, n);
+#endif
+        genB->generate_tile(genB, k, n, _f_B);
+END
+
+
+READ_C(m, n)
+  m = [im = 0 .. %{ return descC->sparsity->nb_nnz_row-1; %}] %{ return descC->sparsity->nnz_rows_index[im]; %}
+  n = [in = 0 .. %{ return descC->sparsity->nb_nnz_cols_in_row[m] - 1;%}] %{ return irr_tm_sparse_block_col_from_index(descC, m, in); %}
+  k = %{ return gemm_irr_sparse_first_gemm(plan, m, n); %}
+
+  prank = %{ return gemm_irr_sparse_row_rank_of_gemm(plan, m, n, k); %}
+  qrank = %{ return gemm_irr_sparse_col_rank_of_gemm(plan, m, n, k); %}
+  g = %{ if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank) ) return gemm_irr_sparse_gpu_of_gemm(plan, m, n, k); return -1;%}
+  p = %{ if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank)) return gemm_irr_sparse_genB_column_phase(plan, n); return -1; %}
+
+:TrivDist(prank, qrank)
+
+READ C <- descC(m, n)        [ layout=parsec_datatype_double_t  count=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %}
+                               layout_data=parsec_datatype_double_t  count_data=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %}
+                               layout_remote=parsec_datatype_double_t  count_remote=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %} ]
+       -> C GEMM(m, n, k)    [ layout=parsec_datatype_double_t  count=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %}
+                               layout_data=parsec_datatype_double_t  count_data=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %}
+                               layout_remote=parsec_datatype_double_t  count_remote=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %} ]
+
+CTL COL <- COL COLUMN_PHASE_CONTROLLER(prank, qrank, g, p)
+
+BODY
+  if( nb_gpu_devices > 0 ) {
+      int g = gemm_irr_sparse_gpu_of_gemm(plan, m, n, k);
+#if defined(GIBS_DEBUG)
+      fprintf(stderr, "Binding C(%d, %d) to GPU %d\n", m, n, g);
+#endif
+      parsec_advise_data_on_device( _f_C->original,
+                                    gpu_device_index[g],
+                                    PARSEC_DEV_DATA_ADVICE_PREFERRED_DEVICE );
+  } else {
+#if defined(GIBS_DEBUG)
+      fprintf(stderr, "Binding C(%d, %d): no GPU?\n", m, n);
+#endif
+  }
+END
+
+
+COLUMN_PHASE_CONTROLLER(prank, qrank, g, cp)
+  prank = 0 .. (TrivDist->grid.rows-1)
+  qrank = 0 .. (TrivDist->grid.cols-1)
+  g = 0 .. nb_gpu_devices - 1
+  mp = %{ if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank)) return gemm_irr_sparse_max_column_phase(plan, g); return -1; %}
+  cp = 0 .. mp
+  mrp_p = %{ if(cp >= CL+1 && gemm_irr_sparse_plan_my_rank(plan, prank, qrank) ) return gemm_irr_sparse_max_row_phase(plan, g, cp-CL-1); return -1;%}
+
+: TrivDist(prank, qrank)
+
+CTL SEQ <- cp      > CL ? SEQ COLUMN_PHASE_CONTROLLER(prank, qrank, g, cp-CL-1)
+        -> cp + CL < mp ? SEQ COLUMN_PHASE_CONTROLLER(prank, qrank, g, cp+CL+1)
+
+CTL COL <- mrp_p > -1 ? [ ig = 0 .. %{ return gemm_irr_sparse_max_gemm_of_row_phase(plan, g, cp-CL-1, mrp_p); %},
+                          m  = %{ return gemm_irr_sparse_gemm_m_of_row_phase(plan, g, cp-CL-1, mrp_p, ig); %},
+                          n  = %{ return gemm_irr_sparse_gemm_n_of_row_phase(plan, g, cp-CL-1, mrp_p, ig); %},
+                          k  = %{ return gemm_irr_sparse_gemm_k_of_row_phase(plan, g, cp-CL-1, mrp_p, ig); %}] COL GEMM(m, n, k)
+        -> [ik = 0 .. %{ return genB->sparsity->nb_nnz_row-1; %},
+             k = %{ return genB->sparsity->nnz_rows_index[ik]; %},
+            in = 0 .. %{ if( cp+GL <= mp ) return gemm_irr_sparse_nb_columns_of_column_phase(plan, g, cp+GL) - 1; return -1; %},
+             n = %{ if( cp+GL <= mp ) return gemm_irr_sparse_column_of_column_phase(plan, g, cp+GL, in); return -1; %} ]
+                 %{ return cp+GL <= mp && irr_tm_sparse_block_is_full(genB, k, n); %} ? COL GEN_B(k, n, prank, qrank)
+        -> [im = 0 .. %{ return descC->sparsity->nb_nnz_row-1; %},
+             m = %{ return descC->sparsity->nnz_rows_index[im]; %},
+            in = 0 .. %{ if( cp <= mp ) return gemm_irr_sparse_nb_columns_of_column_phase(plan, g, cp) - 1; return -1; %},
+             n = %{ return gemm_irr_sparse_column_of_column_phase(plan, g, cp, in); %} ]
+             %{ int k = gemm_irr_sparse_first_gemm(plan, m, n);
+                return irr_tm_sparse_block_is_full(descC, m, n) &&
+                       prank == gemm_irr_sparse_row_rank_of_gemm(plan, m, n, k) &&
+                       qrank == gemm_irr_sparse_col_rank_of_gemm(plan, m, n, k); %} ? COL READ_C(m, n)
+        -> COL ROW_PHASE_CONTROLLER(prank, qrank, g, cp, 0 .. RL)
+
+; 0
+
+BODY
+#if defined(GIBS_DEBUG)
+  char str[256];
+  int in;
+  str[0]='\0';
+  for(in = 0; in < gemm_irr_sparse_nb_columns_of_column_phase(plan, g, cp); in++) {
+      snprintf(str+strlen(str), 256 - strlen(str), "%s%d", in==0?"":", ", gemm_irr_sparse_column_of_column_phase(plan, g, cp, in));
+  }
+  fprintf(stderr, "Column phase controller(%d, %d, %d, %d): enabling generation of B and C for columns %s and Row phase controller(%d, %d, %d, %d, 0)\n",
+          prank, qrank, g, cp, str, prank, qrank, g, cp);
+#endif
+END
+
+
+
+
+ROW_PHASE_CONTROLLER(prank, qrank, g, cp, rp)
+  prank = 0 .. (TrivDist->grid.rows-1)
+  qrank = 0 .. (TrivDist->grid.cols-1)
+  g = 0 .. nb_gpu_devices - 1
+  mcp = %{ if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank)) return gemm_irr_sparse_max_column_phase(plan, g); return -1;%}
+  cp = 0 .. mcp
+  mrp = %{ if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank)) return gemm_irr_sparse_max_row_phase(plan, g, cp); return -1; %}
+  rp = 0 .. mrp
+
+: TrivDist(prank, qrank)
+
+CTL SEQ <- rp > RL     ? SEQ ROW_PHASE_CONTROLLER(prank, qrank, g, cp, rp-RL-1)
+        -> rp < mrp-RL ? SEQ ROW_PHASE_CONTROLLER(prank, qrank, g, cp, rp+RL+1)
+
+CTL COL <- rp <= RL    ? COL COLUMN_PHASE_CONTROLLER(prank, qrank, g, cp)
+
+CTL ROW_BLOCK -> [ ig = 0 .. %{ return gemm_irr_sparse_max_gemm_of_row_phase(plan, g, cp, rp); %},
+                    m = %{ return gemm_irr_sparse_gemm_m_of_row_phase(plan, g, cp, rp, ig); %},
+                    n = %{ return gemm_irr_sparse_gemm_n_of_row_phase(plan, g, cp, rp, ig); %},
+                            k = %{ return gemm_irr_sparse_gemm_k_of_row_phase(plan, g, cp, rp, ig); %} ]
+                 %{ return irr_tm_sparse_block_is_full(descA, m, k) &&
+                           irr_tm_sparse_block_is_full(genB, k, n) &&
+                           irr_tm_sparse_block_is_full(descC, m, n) &&
+                           prank == gemm_irr_sparse_row_rank_of_gemm(plan, m, n, k) &&
+                           qrank == gemm_irr_sparse_col_rank_of_gemm(plan, m, n, k); %} ? ROW_BLOCK GEMM(m, n, k)
+              <-  [ ig = 0 .. %{ if(rp > RL) return gemm_irr_sparse_max_gemm_of_row_phase(plan, g, cp, rp-RL-1); return -1; %},
+                 m = %{ assert(rp > RL); return gemm_irr_sparse_gemm_m_of_row_phase(plan, g, cp, rp-RL-1, ig); %},
+                 n = %{ assert(rp > RL); return gemm_irr_sparse_gemm_n_of_row_phase(plan, g, cp, rp-RL-1, ig); %},
+                         k = %{ assert(rp > RL); return gemm_irr_sparse_gemm_k_of_row_phase(plan, g, cp, rp-RL-1, ig); %} ]
+                  %{ return rp > RL  &&
+                            irr_tm_sparse_block_is_full(descA, m, k) &&
+                            irr_tm_sparse_block_is_full(genB, k, n) &&
+                            irr_tm_sparse_block_is_full(descC, m, n) &&
+                            gemm_irr_sparse_plan_my_rank(plan,
+                              gemm_irr_sparse_row_rank_of_gemm(plan, m, n, k),
+                              gemm_irr_sparse_col_rank_of_gemm(plan, m, n, k) ); %} ? ROW_BLOCK GEMM(m, n, k)
+
+; 0
+
+BODY
+#if defined(GIBS_DEBUG)
+  char gemms[1024];
+int ig, m, n, k;
+  snprintf(gemms, 1024, "[");
+  for(ig = 0; ig <= gemm_irr_sparse_max_gemm_of_row_phase(plan, g, cp, rp); ig++) {
+      m = gemm_irr_sparse_gemm_m_of_row_phase(plan, g, cp, rp, ig);
+      n = gemm_irr_sparse_gemm_n_of_row_phase(plan, g, cp, rp, ig);
+      k = gemm_irr_sparse_gemm_k_of_row_phase(plan, g, cp, rp, ig);
+      snprintf(gemms + strlen(gemms), 1024-strlen(gemms), "%s[%d/%d]G(%d,%d,%d)", ig==0? "" : ", ",
+      irr_tm_sparse_block_is_full(descA, m, k), irr_tm_sparse_block_is_full(genB, k, n), m, n, k);
+  }
+  snprintf(gemms+strlen(gemms), 1024-strlen(gemms), "]");
+  fprintf(stderr, "Row phase controller(%d, %d, %d, %d, %d): enabling %d GEMMs: %s\n",
+         prank, qrank, g, cp, rp, gemm_irr_sparse_max_gemm_of_row_phase(plan, g, cp, rp)+1,
+              gemms);
+#endif
+END
+
+
+GEMM(m, n, k)
+
+  m = [im = 0 .. %{ return descC->sparsity->nb_nnz_row-1; %}] %{ return descC->sparsity->nnz_rows_index[im]; %}
+  n = [in = 0 .. %{ return descC->sparsity->nb_nnz_cols_in_row[m] - 1;%}] %{ return irr_tm_sparse_block_col_from_index(descC, m, in); %}
+  k = [ik = 0 .. %{ return gemm_irr_sparse_nb_gemm(plan, m, n)-1; %}] %{ return gemm_irr_sparse_gemm_k(plan, m, n, ik); %}
+
+  prank = %{ return gemm_irr_sparse_row_rank_of_gemm(plan, m, n, k); %}
+  qrank = %{ return gemm_irr_sparse_col_rank_of_gemm(plan, m, n, k); %}
+  g = %{ if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank) ) return gemm_irr_sparse_gpu_of_gemm(plan, m, n, k); return -1;%}
+  cp = %{ if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank) ) return gemm_irr_sparse_column_phase_of_gemm(plan, m, n, k); return -1; %}
+  rp = %{ if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank) ) return gemm_irr_sparse_row_phase_of_gemm(plan, m, n, k); return -1; %}
+
+  kprev = %{  if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank) ) return gemm_irr_sparse_prev_gemm(plan, m, n, k); return -1; %}
+  knext = %{  if(gemm_irr_sparse_plan_my_rank(plan, prank, qrank) ) return gemm_irr_sparse_next_gemm(plan, m, n, k); return -1; %}
+
+:TrivDist(prank, qrank)
+
+CTL ROW_BLOCK <- ROW_BLOCK ROW_PHASE_CONTROLLER(prank, qrank, g, cp, rp)
+              -> %{ return rp+RL+1 <= gemm_irr_sparse_max_row_phase(plan, g, cp); %} ? ROW_BLOCK ROW_PHASE_CONTROLLER(prank, qrank, g, cp, rp+RL+1)
+
+CTL COL -> %{ return ((rp == gemm_irr_sparse_max_row_phase(plan, g, cp)) &&
+                      (cp + CL < gemm_irr_sparse_max_column_phase(plan, g))); %} ? COL COLUMN_PHASE_CONTROLLER(prank, qrank, g, cp+CL+1)
+
+READ A <- A READ_A(m, k)
+    [ layout=parsec_datatype_double_t  count=%{ return irr_bs_tm_get_tile_count(descA, m, k); %}
+      layout_data=parsec_datatype_double_t  count_data=%{ return irr_bs_tm_get_tile_count(descA, m, k); %}
+      layout_remote=parsec_datatype_double_t  count_remote=%{ return irr_bs_tm_get_tile_count(descA, m, k); %} ]
+READ B <- B GEN_B(k, n, prank, qrank)
+   [ layout=parsec_datatype_double_t  count=%{ return irr_bs_tm_get_tile_count(genB, k, n); %}
+     layout_data=parsec_datatype_double_t  count_data=%{ return irr_bs_tm_get_tile_count(genB, k, n); %}
+     layout_remote=parsec_datatype_double_t  count_remote=%{ return irr_bs_tm_get_tile_count(genB, k, n); %} ]
+RW   C <- kprev == -1 ? C READ_C(m, n) : C GEMM(m, n, kprev)
+   [ layout=parsec_datatype_double_t  count=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %}
+     layout_data=parsec_datatype_double_t  count_data=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %}
+     layout_remote=parsec_datatype_double_t  count_remote=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %} ]
+       -> knext != -1 ? C GEMM(m, n, knext) : descC(m, n)
+   [ layout=parsec_datatype_double_t  count=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %}
+     layout_data=parsec_datatype_double_t  count_data=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %}
+     layout_remote=parsec_datatype_double_t  count_remote=%{ return gemm_irr_sparse_C_tile_count(descA, genB, m, n); %} ]
+
+; 0
+
+BODY [type=CUDA]
+{
+#if defined(PRECISION_z) || defined(PRECISION_c)
+    double lalpha = make_double((alpha), (alpha));
+    double lbeta  = (k == 0) ? make_double((beta), (beta))
+                                      : make_double(1.0, 0.0);
+#else
+    double lalpha = alpha;
+    double lbeta  = (k == 0) ? beta : 1.0;
+#endif
+    int cAmb = descA->Mtiling[m];
+    int cAnb = descA->Ntiling[k];
+    int cBmb = genB->Mtiling[k];
+    int cBnb = genB->Ntiling[n];
+    int cCmb = cAmb; assert(cCmb == descC->Mtiling[m]);
+    int cCnb = cBnb; assert(cCnb == descC->Ntiling[n]);
+
+    int tempmm = cCmb;
+    int tempnn = cCnb;
+    int tempkk = cAnb;
+    int ldam = cAmb;
+    int ldbk = cBmb;
+    int ldcm = cCmb;
+
+    int64_t my_flops = 2LL * (int64_t)tempmm * (int64_t)tempnn * (int64_t)tempkk;
+
+#if defined(GIBS_DEBUG)
+    fprintf(stderr, "Do GEMM(%d, %d, %d) that belongs to column-phase %d, row-phase %d of gpu %d on rank (%d, %d) -- %"PRId64" flops\n", m, n, k, cp, rp, g, prank, qrank, my_flops);
+#endif
+
+    if(-1 != flops) {
+        time_t now, old;
+        int64_t flops_now = parsec_atomic_fetch_add_int64(&flops, my_flops);
+        time(&now);
+        old = last_log;
+        if( now - old > 60 ) {
+            if( parsec_atomic_cas_int64(&last_log, old, now) ) {
+                   int64_t dur = (int64_t)now-(int64_t)start_log;
+                fprintf(stderr, "T: %10"PRId64" R: %3d GFlops: %10.0g GFlop/s: %g\n", dur, descA->super.myrank, (double)flops_now/1e9, (double)flops_now/1e9/(double)dur);
+            }
+        }
+    }
+
+    PARSEC_DEBUG_VERBOSE(10, parsec_debug_output,
+            "CUDA: gemm( %d, %d, %d ) > A(%d,%d) * B(%d,%d) C(%d,%d)\n",
+             m, n, k, cAmb, cAnb, cBmb, cBnb, cCmb, cCnb);
+
+    cublasStatus_t status;
+    cublasSetKernelStream( parsec_body.stream );
+    cublasDgemm( 'N', 'N',
+             tempmm, tempnn, tempkk,
+             lalpha, (double*)A, ldam,
+                     (double*)B, ldbk,
+             lbeta,  (double*)C, ldcm );
+    status = cublasGetError();
+    PARSEC_CUDA_CHECK_ERROR( "cublasDgemm ", status,
+                            {return PARSEC_HOOK_RETURN_DONE;} );
+
+#if 0
+   if( knext == -1 ) {
+      gpu_task->pushout |= (1 << 0);
+   }
+#endif
+}
+END
+
+BODY [type=HIP]
+{
+#if defined(PRECISION_z) || defined(PRECISION_c)
+    hipblasDoubleComplex lalpha = { (alpha), (alpha) };
+    hipblasDoubleComplex lbeta  = (k == 0) ? { (beta), (beta) }
+                                           : { 1.0, 0.0 };
+#else
+    double lalpha = alpha;
+    double lbeta  = (k == 0) ? beta : 1.0;
+#endif
+    int cAmb = descA->Mtiling[m];
+    int cAnb = descA->Ntiling[k];
+    int cBmb = genB->Mtiling[k];
+    int cBnb = genB->Ntiling[n];
+    int cCmb = cAmb; assert(cCmb == descC->Mtiling[m]);
+    int cCnb = cBnb; assert(cCnb == descC->Ntiling[n]);
+
+    int tempmm = cCmb;
+    int tempnn = cCnb;
+    int tempkk = cAnb;
+    int ldam = cAmb;
+    int ldbk = cBmb;
+    int ldcm = cCmb;
+
+    int64_t my_flops = 2LL * (int64_t)tempmm * (int64_t)tempnn * (int64_t)tempkk;
+
+#if defined(GIBS_DEBUG)
+    fprintf(stderr, "Do GEMM(%d, %d, %d) that belongs to column-phase %d, row-phase %d of gpu %d on rank (%d, %d) -- %"PRId64" flops\n", m, n, k, cp, rp, g, prank, qrank, my_flops);
+#endif
+
+    if(-1 != flops) {
+      time_t now, old;
+      int64_t flops_now = parsec_atomic_fetch_add_int64(&flops, my_flops);
+      time(&now);
+      old = last_log;
+      if( now - old > 60 ) {
+          if( parsec_atomic_cas_int64(&last_log, old, now) ) {
+                int64_t dur = (int64_t)now-(int64_t)start_log;
+              fprintf(stderr, "T: %10"PRId64" R: %3d GFlops: %10.0g GFlop/s: %g\n", dur, descA->super.myrank, (double)flops_now/1e9, (double)flops_now/1e9/(double)dur);
+          }
+      }
+    }
+
+    PARSEC_DEBUG_VERBOSE(10, parsec_debug_output,
+            "HIP: gemm( %d, %d, %d ) > A(%d,%d) * B(%d,%d) C(%d,%d)\n",
+             m, n, k, cAmb, cAnb, cBmb, cBnb, cCmb, cCnb);
+
+    hipblasStatus_t status;
+    hipblasOperation_t opA = HIPBLAS_OP_N;
+    hipblasOperation_t opB = HIPBLAS_OP_N;
+    handles_infokey_t *handles = parsec_info_get(&gpu_stream->infos, handles_infokey);
+    assert(NULL != handles);
+    status = hipblasDgemm( handles->hipblas_handle,
+                           opA, opB,
+                           tempmm, tempnn, tempkk,
+                           &lalpha, A, ldam,
+                                    B, ldbk,
+                           &lbeta,  C, ldcm );
+    HIPBLAS_CHECK_ERROR( "hipblasDgemm ", status,
+                            {return PARSEC_HOOK_RETURN_DONE;} );
+
+#if 0
+   if( knext == -1 ) {
+      gpu_task->pushout |= (1 << 0);
+   }
+#endif
+}
+END
+
+BODY
+   fprintf(stderr, "Do GEMM(%d, %d, %d) that belongs to column-phase %d, row-phase %d of gpu %d on rank (%d, %d)\n", m, n, k, cp, rp, g, prank, qrank);
+END
