@@ -1,0 +1,3 @@
+[submodule "parsec"]
+	path = parsec
+	url = github.com:icldisco/parsec
